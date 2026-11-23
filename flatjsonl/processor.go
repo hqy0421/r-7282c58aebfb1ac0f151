@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"regexp"
 	"runtime"
@@ -346,19 +345,36 @@ func (p *Processor) PrepareKeys() error {
 }
 
 // WriteOutput runs second pass of reading to create the output.
-func (p *Processor) WriteOutput() error {
+func (p *Processor) WriteOutput() (runErr error) {
+	// Close all receivers regardless of where the run failed, so that
+	// finalized targets remain independently receivable and the report can
+	// classify every target (receivable / not_batched / failed).
 	defer func() {
-		if err := p.w.Close(); err != nil {
-			log.Fatalf("failed to close writer: %v", err)
+		closeErr := p.w.Close()
+
+		rep := p.w.Report()
+		p.emitReport(rep)
+
+		if runErr == nil && closeErr != nil {
+			runErr = fmt.Errorf("failed to close writer: %w", closeErr)
+		} else if closeErr != nil {
+			p.Log(fmt.Sprintf("failed to close writer: %v", closeErr))
 		}
 	}()
 
 	if err := p.setupWriters(); err != nil {
+		p.w.MarkRunFailed()
+
 		return err
 	}
 
 	if p.w.HasReceivers() {
-		if err := p.iterateForWriters(); err != nil {
+		err := p.iterateForWriters()
+		if err != nil {
+			// The batch did not complete; targets already closed in defer stay
+			// independently receivable, the rest are not_batched.
+			p.w.MarkRunFailed()
+
 			return err
 		}
 
@@ -366,6 +382,76 @@ func (p *Processor) WriteOutput() error {
 	}
 
 	return nil
+}
+
+// emitReport writes the JSON manifest to the configured destination and always
+// logs a per-target summary to stderr.
+func (p *Processor) emitReport(rep RunReport) {
+	if len(rep.Targets) == 0 {
+		return
+	}
+
+	b, err := json.MarshalIndent(rep, "", " ")
+	if err != nil {
+		p.Log("failed to marshal run report: " + err.Error())
+	} else {
+		switch p.f.Report {
+		case "":
+			// No manifest file requested, keep summary only.
+		case "-":
+			p.Log(string(b))
+		default:
+			if werr := os.WriteFile(p.f.Report, append(b, '\n'), 0o644); werr != nil {
+				p.Log("failed to write run report: " + werr.Error())
+			} else {
+				p.Log("run report written to " + p.f.Report)
+			}
+		}
+	}
+
+	p.Log(p.summarizeReport(rep))
+}
+
+// summarizeReport renders a human-readable, per-target nightly summary.
+func (p *Processor) summarizeReport(rep RunReport) string {
+	var sb strings.Builder
+
+	if rep.Completed {
+		sb.WriteString(fmt.Sprintf("run report: batch completed, %d target(s):\n", len(rep.Targets)))
+	} else {
+		sb.WriteString(fmt.Sprintf("run report: batch FAILED, %d target(s):\n", len(rep.Targets)))
+	}
+
+	for _, t := range rep.Targets {
+		line := fmt.Sprintf("  - [%s] %s -> %s, rows=%d, fields=%d",
+			t.Status, t.Type, t.Target, t.RowsWritten, len(t.Fields))
+
+		if len(t.Partitions) > 0 {
+			line += fmt.Sprintf(", partitions=%d", len(t.Partitions))
+		}
+
+		if t.CompletedAt != nil {
+			line += ", completed_at=" + t.CompletedAt.Format(time.RFC3339)
+		}
+
+		if t.Error != "" {
+			line += ", error=" + t.Error
+		}
+
+		sb.WriteString(line + "\n")
+
+		for _, pt := range t.Partitions {
+			part := fmt.Sprintf("      partition %q (%s): rows=%d, fields=%d",
+				pt.Name, pt.Kind, pt.RowsWritten, len(pt.Fields))
+			if pt.RowGroups > 0 {
+				part += fmt.Sprintf(", row_groups=%d", pt.RowGroups)
+			}
+
+			sb.WriteString(part + "\n")
+		}
+	}
+
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 func (p *Processor) maybeShowKeys() error {
@@ -464,7 +550,7 @@ func (p *Processor) setupWriters() error {
 		}
 
 		cw.b.p = p
-		p.w.Add(cw)
+		p.w.AddTarget(cw, p.f.CSV, "csv")
 	}
 
 	if p.f.Parquet != "" {
@@ -473,7 +559,7 @@ func (p *Processor) setupWriters() error {
 			return fmt.Errorf("failed to create parquet file: %w", err)
 		}
 
-		p.w.Add(pw)
+		p.w.AddTarget(pw, p.f.Parquet, "parquet")
 	}
 
 	if p.f.DuckDB != "" {
@@ -482,7 +568,7 @@ func (p *Processor) setupWriters() error {
 			return fmt.Errorf("failed to open DuckDB CLI writer: %w", err)
 		}
 
-		p.w.Add(w)
+		p.w.AddTarget(w, p.f.DuckDB, "duckdb_cli")
 	}
 
 	if p.f.SQLite != "" {
@@ -492,14 +578,14 @@ func (p *Processor) setupWriters() error {
 				return fmt.Errorf("failed to open SQLite file: %w", err)
 			}
 
-			p.w.Add(cw)
+			p.w.AddTarget(cw, p.f.SQLite, "sqlite_cli")
 		} else {
 			cw, err := NewSQLiteWriter(p.f.SQLite, p.f.SQLTable, p)
 			if err != nil {
 				return fmt.Errorf("failed to open SQLite file: %w", err)
 			}
 
-			p.w.Add(cw)
+			p.w.AddTarget(cw, p.f.SQLite, "sqlite")
 		}
 	}
 
@@ -509,7 +595,7 @@ func (p *Processor) setupWriters() error {
 			return fmt.Errorf("failed to open PostgreSQL dump file: %w", err)
 		}
 
-		p.w.Add(w)
+		p.w.AddTarget(w, p.f.PGDump, "pg_dump")
 	}
 
 	if p.f.Raw != "" {
@@ -520,7 +606,7 @@ func (p *Processor) setupWriters() error {
 
 		rw.b.p = p
 
-		p.w.Add(rw)
+		p.w.AddTarget(rw, p.f.Raw, "raw")
 	}
 
 	return nil

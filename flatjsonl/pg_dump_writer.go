@@ -35,7 +35,8 @@ type PGDumpWriter struct {
 	sortedTransposed []string
 	sortedTables     []string
 
-	linesReceived int
+	linesReceived int64
+	rowsByTable   map[string]int64
 }
 
 type csvCopier struct {
@@ -49,12 +50,13 @@ func NewPGDumpWriter(fn string, tableName string, p *Processor) (*PGDumpWriter, 
 	var err error
 
 	c := &PGDumpWriter{
-		fn:         fn,
-		tableName:  tableName,
-		replacer:   strings.NewReplacer(`"`, `""`),
-		p:          p,
-		maxCols:    p.f.SQLMaxCols - 1, // -1 for _seq_id.
-		csvCopiers: map[string]csvCopier{},
+		fn:          fn,
+		tableName:   tableName,
+		replacer:    strings.NewReplacer(`"`, `""`),
+		p:           p,
+		maxCols:     p.f.SQLMaxCols - 1, // -1 for _seq_id.
+		csvCopiers:  map[string]csvCopier{},
+		rowsByTable: map[string]int64{},
 	}
 
 	if fn == "<nop>" {
@@ -205,6 +207,8 @@ func (c *PGDumpWriter) insert(seq int64, tn string, values []string) error {
 				return err
 			}
 
+			c.rowsByTable[tableName]++
+
 			break
 		}
 
@@ -216,6 +220,8 @@ func (c *PGDumpWriter) insert(seq int64, tn string, values []string) error {
 		if err := tw.cw.Write(row); err != nil {
 			return err
 		}
+
+		c.rowsByTable[tableName]++
 
 		part++
 		tableName = tn + partSuffix + strconv.Itoa(part)
@@ -323,4 +329,56 @@ func (c *PGDumpWriter) Close() error {
 	}
 
 	return c.f.Close()
+}
+
+// Report describes rows actually written and the table partitions
+// (transposed tables and _partN wide-table splits) of this PostgreSQL dump.
+func (c *PGDumpWriter) Report() TargetReport {
+	rep := TargetReport{
+		Type:   "pg_dump",
+		Target: c.fn,
+		Fields: baseFields(c.b),
+	}
+
+	if c.b == nil {
+		return rep
+	}
+
+	logicalKeys := map[string][]flKey{c.tableName: c.b.filteredKeys}
+	logicalKind := map[string]string{c.tableName: "primary"}
+
+	for _, dst := range c.sortedTransposed {
+		tn := c.table(dst)
+		logicalKeys[tn] = c.b.transposed[dst].filteredKeys
+		logicalKind[tn] = "transpose"
+	}
+
+	logicalNames := make([]string, 0, len(logicalKeys))
+	for tn := range logicalKeys {
+		logicalNames = append(logicalNames, tn)
+	}
+
+	sort.Strings(logicalNames)
+
+	for _, tn := range logicalNames {
+		kind := logicalKind[tn]
+
+		for _, physical := range c.sortedTables {
+			if physical != tn && !strings.HasPrefix(physical, tn+partSuffix) {
+				continue
+			}
+
+			n := c.rowsByTable[physical]
+			rep.RowsWritten += n
+
+			rep.Partitions = append(rep.Partitions, PartitionReport{
+				Name:        physical,
+				Kind:        kind,
+				RowsWritten: n,
+				Fields:      fieldInfos(logicalKeys[tn]),
+			})
+		}
+	}
+
+	return rep
 }

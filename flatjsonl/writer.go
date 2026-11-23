@@ -6,8 +6,10 @@ import (
 	"io"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bool64/progress"
 	"github.com/klauspost/compress/zstd"
@@ -28,6 +30,24 @@ type WriteReceiver interface {
 type Writer struct {
 	receivers []WriteReceiver
 	Progress  *progress.Progress
+
+	// names maps a receiver to its destination label (file path/table).
+	names map[WriteReceiver]string
+	// types maps a receiver to its output kind (parquet, sqlite, ...).
+	types map[WriteReceiver]string
+
+	// setupErrs keeps SetupKeys failures per receiver.
+	setupErrs map[WriteReceiver]error
+	// rowErrs keeps the first ReceiveRow failure per receiver.
+	rowErrs map[WriteReceiver]error
+	// closeErrs keeps Close failures per receiver.
+	closeErrs map[WriteReceiver]error
+	// completedAt keeps finalization time per receiver.
+	completedAt map[WriteReceiver]time.Time
+
+	// runFailed marks that the batch itself did not complete, so finalized
+	// targets remain independently receivable while unfinalized ones are not batched.
+	runFailed bool
 }
 
 // Value encapsulates value of an allowed Type.
@@ -62,12 +82,14 @@ func (v Value) Format() string {
 	}
 }
 
-// SetupKeys configures writers.
+// SetupKeys configures writers, recording per-receiver setup failures without
+// aborting the remaining receivers.
 func (w *Writer) SetupKeys(keys []flKey) error {
 	var errs []string
 
 	for _, r := range w.receivers {
 		if err := r.SetupKeys(keys); err != nil {
+			w.setupErrs[r] = err
 			errs = append(errs, err.Error())
 		}
 	}
@@ -79,12 +101,17 @@ func (w *Writer) SetupKeys(keys []flKey) error {
 	return nil
 }
 
-// ReceiveRow passes row to all receivers.
+// ReceiveRow passes row to all receivers, recording per-receiver failures while
+// still attempting the other receivers.
 func (w *Writer) ReceiveRow(seq int64, values []Value) error {
 	var errs []string
 
 	for _, r := range w.receivers {
 		if err := r.ReceiveRow(seq, values); err != nil {
+			if _, ok := w.rowErrs[r]; !ok {
+				w.rowErrs[r] = err
+			}
+
 			errs = append(errs, err.Error())
 		}
 	}
@@ -96,13 +123,35 @@ func (w *Writer) ReceiveRow(seq int64, values []Value) error {
 	return nil
 }
 
-// Add adds another row receiver.
+// Add adds another row receiver and registers its destination label and kind.
 func (w *Writer) Add(r WriteReceiver) {
+	w.AddTarget(r, "", "")
+}
+
+// AddTarget adds a row receiver with a destination label and output kind.
+func (w *Writer) AddTarget(r WriteReceiver, target string, kind string) {
+	if w.names == nil {
+		w.names = map[WriteReceiver]string{}
+		w.types = map[WriteReceiver]string{}
+		w.setupErrs = map[WriteReceiver]error{}
+		w.rowErrs = map[WriteReceiver]error{}
+		w.closeErrs = map[WriteReceiver]error{}
+		w.completedAt = map[WriteReceiver]time.Time{}
+	}
+
 	w.receivers = append(w.receivers, r)
+	w.names[r] = target
+	w.types[r] = kind
 
 	if m, ok := r.(progress.MetricsExposer); ok {
 		w.Progress.AddMetrics(m.Metrics()...)
 	}
+}
+
+// MarkRunFailed flags that the batch processing itself failed. Finalized
+// receivers stay independently receivable; unfinalized ones are not batched.
+func (w *Writer) MarkRunFailed() {
+	w.runFailed = true
 }
 
 // HasReceivers is true if there are receivers.
@@ -110,13 +159,23 @@ func (w *Writer) HasReceivers() bool {
 	return len(w.receivers) > 0
 }
 
-// Close tries to close all receivers and returns combined error in case of failures.
+// Close tries to close all receivers, recording per-receiver failures and
+// completion times while still closing every receiver.
 func (w *Writer) Close() error {
 	var errs []string
 
 	for _, r := range w.receivers {
 		if err := r.Close(); err != nil {
+			w.closeErrs[r] = err
 			errs = append(errs, err.Error())
+
+			continue
+		}
+
+		if _, failed := w.setupErrs[r]; !failed {
+			if _, rowFailed := w.rowErrs[r]; !rowFailed {
+				w.completedAt[r] = time.Now()
+			}
 		}
 	}
 
@@ -125,6 +184,71 @@ func (w *Writer) Close() error {
 	}
 
 	return nil
+}
+
+// Report builds a manifest of what was actually written to every target.
+func (w *Writer) Report() RunReport {
+	rep := RunReport{
+		Completed:   !w.runFailed && len(w.setupErrs) == 0 && len(w.rowErrs) == 0 && len(w.closeErrs) == 0,
+		GeneratedAt: time.Now(),
+		Targets:     make([]TargetReport, 0, len(w.receivers)),
+	}
+
+	for _, r := range w.receivers {
+		var t TargetReport
+		if rr, ok := r.(Reporter); ok {
+			t = rr.Report()
+		} else {
+			t = TargetReport{Type: w.types[r], Target: w.names[r]}
+		}
+
+		if t.Type == "" {
+			t.Type = w.types[r]
+		}
+
+		if t.Target == "" {
+			t.Target = w.names[r]
+		}
+
+		switch {
+		case w.setupErrs[r] != nil:
+			t.Status = TargetStatusFailed
+			t.Error = w.setupErrs[r].Error()
+		case w.rowErrs[r] != nil:
+			t.Status = TargetStatusFailed
+			t.Error = w.rowErrs[r].Error()
+		case w.closeErrs[r] != nil:
+			t.Status = TargetStatusFailed
+			t.Error = w.closeErrs[r].Error()
+		case w.runFailed:
+			if doneAt, ok := w.completedAt[r]; ok {
+				// The artifact was finalized before/while the batch aborted,
+				// it can be consumed on its own.
+				t.Status = TargetStatusReceivable
+				t.CompletedAt = &doneAt
+			} else {
+				// The target was never closed: its artifact is partial.
+				t.Status = TargetStatusNotBatched
+				t.Error = "batch failed before target was finalized"
+			}
+		default:
+			doneAt := w.completedAt[r]
+			t.Status = TargetStatusReceivable
+			t.CompletedAt = &doneAt
+		}
+
+		rep.Targets = append(rep.Targets, t)
+	}
+
+	sort.Slice(rep.Targets, func(i, j int) bool {
+		if rep.Targets[i].Target == rep.Targets[j].Target {
+			return rep.Targets[i].Type < rep.Targets[j].Type
+		}
+
+		return rep.Targets[i].Target < rep.Targets[j].Target
+	})
+
+	return rep
 }
 
 type idxKey struct {

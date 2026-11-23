@@ -183,6 +183,8 @@ Usage of flatjsonl:
         Output to RAW file (column values are written as is without escaping, gzip encoded if ends with .gz).
   -raw-delim string
         RAW file column delimiter.
+  -report string
+        Write a JSON manifest of every output target (rows written, fields, partitions, status); use - for stderr.
   -replace-keys
         Use unique tail segment converted to snake_case as key.
   -show-json-schema
@@ -334,3 +336,29 @@ Extract a single column from JSONL log (equivalent to `cat huge.log | jq .foo.ba
 ```
 flatjsonl -input huge.log -raw entries.log -get-key ".foo.bar.baz"
 ```
+
+## Run report (nightly manifest)
+
+When several outputs are written at once (for example Parquet and SQLite), each target can finish or fail on its
+own. Use `-report manifest.json` to get a per-target manifest that records what was actually written, bound to the
+fields and partitions of every output. A human-readable summary is always printed to STDERR even without `-report`.
+
+```
+flatjsonl -parquet out.parquet -sqlite out.sqlite -report manifest.json events.jsonl
+```
+
+Each target entry contains:
+
+- `status`:
+  - `independently_receivable` — the target was finalized successfully and can be consumed on its own, even if another
+    target of the same run failed;
+  - `not_batched` — the batch aborted and this target was never finalized, so its artifact is partial;
+  - `failed` — the target itself failed during setup, row writing or closing (`error` carries the reason).
+- `rows_written` — rows actually written to the target (transposed/exploded rows are counted in their partitions).
+- `fields` — the columns of the primary output, each with its inferred type.
+- `partitions` — transposed tables/files (`"transpose"`), wide-table splits such as `table_part2`
+  (`"column_split"`) and the primary output (`"primary"`); Parquet partitions also report `row_groups`.
+- `completed_at` — finalization time, which can differ between a Parquet and a SQLite target.
+
+A target that closes successfully while a sibling fails stays `independently_receivable`, so a nightly job can safely
+consume the finished artifact instead of discarding the whole batch.

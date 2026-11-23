@@ -11,6 +11,8 @@ type CSVWriter struct {
 	nullValue string
 	w         *csv.Writer
 
+	rowsWritten int64
+
 	transposed map[string]*CSVWriter
 
 	*fileWriter
@@ -104,6 +106,8 @@ func (c *CSVWriter) ReceiveRow(seq int64, values []Value) error {
 			if err := c.w.Write(row); err != nil {
 				return fmt.Errorf("writing transposed CSV row: %w", err)
 			}
+
+			c.rowsWritten++
 		}
 
 		return nil
@@ -115,6 +119,8 @@ func (c *CSVWriter) ReceiveRow(seq int64, values []Value) error {
 		if err := c.w.Write(c.b.row); err != nil {
 			return fmt.Errorf("writing CSV row: %w", err)
 		}
+
+		c.rowsWritten++
 	}
 
 	for dst, tw := range c.transposed {
@@ -189,4 +195,34 @@ func (c *CSVWriter) Close() error {
 	}
 
 	return c.f.Close()
+}
+
+// Report describes rows actually written and the transposed CSV files.
+func (c *CSVWriter) Report() TargetReport {
+	rep := TargetReport{
+		Type:        "csv",
+		Target:      c.fn,
+		RowsWritten: c.rowsWritten,
+		Fields:      baseFields(c.b),
+		Partitions: []PartitionReport{{
+			Name:        c.fn,
+			Kind:        "primary",
+			RowsWritten: c.rowsWritten,
+			Fields:      baseFields(c.b),
+		}},
+	}
+
+	for _, dst := range sortedReportKeys(c.transposed) {
+		tw := c.transposed[dst]
+
+		rep.Partitions = append(rep.Partitions, PartitionReport{
+			Name:        tw.fn,
+			Kind:        "transpose",
+			RowsWritten: tw.rowsWritten,
+			Fields:      baseFields(tw.b),
+		})
+		rep.RowsWritten += tw.rowsWritten
+	}
+
+	return rep
 }

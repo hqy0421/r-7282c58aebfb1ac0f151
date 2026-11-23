@@ -13,6 +13,7 @@ import (
 // SQLiteWriter inserts rows into SQLite database.
 type SQLiteWriter struct {
 	db        *sql.DB
+	fn        string
 	tableName string
 	tx        *sql.Tx
 	rowsTx    int
@@ -20,6 +21,12 @@ type SQLiteWriter struct {
 	replacer  *strings.Replacer
 	p         *Processor
 	maxCols   int
+
+	// rowsWritten counts actual INSERT statements per physical table,
+	// including _partN splits.
+	rowsWritten map[string]int64
+	// parts tracks the highest split number created per logical table.
+	parts map[string]int
 
 	transposed map[string]*baseWriter
 	b          *baseWriter
@@ -48,11 +55,14 @@ func NewSQLiteWriter(fn string, tableName string, p *Processor) (*SQLiteWriter, 
 	}
 
 	c := &SQLiteWriter{
-		db:        db,
-		tableName: tableName,
-		replacer:  strings.NewReplacer(`"`, `""`),
-		p:         p,
-		maxCols:   p.f.SQLMaxCols - 1, // -1 for _seq_id.
+		db:          db,
+		fn:          fn,
+		tableName:   tableName,
+		replacer:    strings.NewReplacer(`"`, `""`),
+		p:           p,
+		maxCols:     p.f.SQLMaxCols - 1, // -1 for _seq_id.
+		rowsWritten: map[string]int64{},
+		parts:       map[string]int{},
 	}
 
 	return c, nil
@@ -149,8 +159,14 @@ func (c *SQLiteWriter) insert(seq int64, tn string, values []Value) error {
 				return err
 			}
 
+			c.rowsWritten[tableName]++
+
 			part++
 			tableName = tn + partSuffix + strconv.Itoa(part)
+			if part > c.parts[tn] {
+				c.parts[tn] = part
+			}
+
 			res = `INSERT INTO "` + tableName + `" VALUES (` + strconv.Itoa(int(seq)) + `,`
 		}
 
@@ -163,7 +179,13 @@ func (c *SQLiteWriter) insert(seq int64, tn string, values []Value) error {
 
 	res = res[:len(res)-1] + ")"
 
-	return c.execTx(res)
+	if err := c.execTx(res); err != nil {
+		return err
+	}
+
+	c.rowsWritten[tableName]++
+
+	return nil
 }
 
 func (c *SQLiteWriter) commitTx() error {
@@ -270,4 +292,72 @@ func (c *SQLiteWriter) Close() error {
 	}
 
 	return c.db.Close()
+}
+
+// Report describes rows actually inserted, the columns and the physical table
+// partitions (transposed tables and _partN wide-table splits) of this SQLite target.
+func (c *SQLiteWriter) Report() TargetReport {
+	rep := TargetReport{
+		Type:   "sqlite",
+		Target: c.fn,
+		Fields: baseFields(c.b),
+	}
+
+	if c.b == nil {
+		return rep
+	}
+
+	logical := []string{c.tableName}
+	for _, dst := range sortedReportKeys(c.transposed) {
+		logical = append(logical, c.table(dst))
+	}
+
+	for _, tn := range logical {
+		kind := "primary"
+		var keys []flKey
+
+		if tn != c.tableName {
+			kind = "transpose"
+			if tw, ok := c.transposed[strings.TrimPrefix(tn, c.tableName+"_")]; ok {
+				keys = tw.filteredKeys
+			}
+		} else {
+			keys = c.b.filteredKeys
+		}
+
+		var rows int64
+
+		if c.parts[tn] == 0 {
+			rows = c.rowsWritten[tn]
+
+			rep.Partitions = append(rep.Partitions, PartitionReport{
+				Name:        tn,
+				Kind:        kind,
+				RowsWritten: rows,
+				Fields:      fieldInfos(keys),
+			})
+		} else {
+			// Wide table split into _part2 ... _partN; expose every physical table.
+			for part := 1; part <= c.parts[tn]; part++ {
+				name := tn
+				if part > 1 {
+					name = tn + partSuffix + strconv.Itoa(part)
+				}
+
+				n := c.rowsWritten[name]
+				rows += n
+
+				rep.Partitions = append(rep.Partitions, PartitionReport{
+					Name:        name,
+					Kind:        "column_split",
+					RowsWritten: n,
+					Fields:      fieldInfos(keys),
+				})
+			}
+		}
+
+		rep.RowsWritten += rows
+	}
+
+	return rep
 }

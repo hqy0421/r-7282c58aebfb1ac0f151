@@ -41,6 +41,8 @@ type Flags struct {
 	Raw      string
 	RawDelim string
 
+	Report string
+
 	MaxLines            int
 	OffsetLines         int
 	MaxLinesKeys        int
@@ -91,6 +93,8 @@ func (f *Flags) Register() {
 
 	flag.StringVar(&f.Raw, "raw", "", "Output to RAW file (column values are written as is without escaping, gzip encoded if ends with .gz).")
 	flag.StringVar(&f.RawDelim, "raw-delim", "", "RAW file column delimiter.")
+
+	flag.StringVar(&f.Report, "report", "", "Write a JSON manifest of every output target (rows written, fields, partitions, status); use - for stderr.")
 
 	flag.IntVar(&f.Verbosity, "verbosity", 1, "Show progress in STDERR, 0 disables status, 2 adds more metrics.")
 	flag.DurationVar(&f.ProgressInterval, "progress-interval", 5*time.Second, "Progress update interval.")

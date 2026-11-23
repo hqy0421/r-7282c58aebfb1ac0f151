@@ -27,6 +27,9 @@ type ParquetWriter struct {
 	rowsBatch      []parquet.Row
 	batchSize      int
 
+	rowsWritten int64
+	rowGroups   int
+
 	transposed map[string]*ParquetWriter
 
 	*fileWriter
@@ -254,6 +257,7 @@ func (c *ParquetWriter) writeRow(values []Value) error {
 	}
 
 	c.rowsInGroup++
+	c.rowsWritten++
 
 	if c.rowsInGroup >= c.flushSize {
 		if err := c.flushBatch(); err != nil {
@@ -264,6 +268,7 @@ func (c *ParquetWriter) writeRow(values []Value) error {
 			return fmt.Errorf("failed to flush parquet row group: %w", err)
 		}
 
+		c.rowGroups++
 		c.rowsInGroup = 0
 	}
 
@@ -368,6 +373,12 @@ func (c *ParquetWriter) Close() error {
 		if err := c.w.Close(); err != nil {
 			return fmt.Errorf("failed to close parquet writer: %w", err)
 		}
+
+		// A non-empty trailing group becomes one more row group on close.
+		if c.rowsInGroup > 0 {
+			c.rowGroups++
+			c.rowsInGroup = 0
+		}
 	}
 
 	if c.fileWriter == nil {
@@ -375,4 +386,37 @@ func (c *ParquetWriter) Close() error {
 	}
 
 	return c.f.Close()
+}
+
+// Report describes rows, columns, row groups and transposed partitions
+// actually written by this Parquet target.
+func (c *ParquetWriter) Report() TargetReport {
+	rep := TargetReport{
+		Type:        "parquet",
+		Target:      c.fn,
+		RowsWritten: c.rowsWritten,
+		Fields:      baseFields(c.b),
+		Partitions: []PartitionReport{{
+			Name:        c.fn,
+			Kind:        "primary",
+			RowsWritten: c.rowsWritten,
+			RowGroups:   c.rowGroups,
+			Fields:      baseFields(c.b),
+		}},
+	}
+
+	for _, dst := range sortedReportKeys(c.transposed) {
+		tw := c.transposed[dst]
+
+		rep.Partitions = append(rep.Partitions, PartitionReport{
+			Name:        tw.fn,
+			Kind:        "transpose",
+			RowsWritten: tw.rowsWritten,
+			RowGroups:   tw.rowGroups,
+			Fields:      baseFields(tw.b),
+		})
+		rep.RowsWritten += tw.rowsWritten
+	}
+
+	return rep
 }

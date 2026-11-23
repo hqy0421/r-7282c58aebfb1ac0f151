@@ -79,6 +79,14 @@ func (w *DuckDBCLIWriter) Close() error {
 	return nil
 }
 
+// Report describes rows and partitions rendered into the DuckDB CLI import.
+func (w *DuckDBCLIWriter) Report() TargetReport {
+	rep := w.mainCSV.Report()
+	rep.Type = "duckdb_cli"
+
+	return rep
+}
+
 func quoteDuckDBIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }

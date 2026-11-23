@@ -84,3 +84,11 @@ func (w *SQLite3CLIWriter) Close() error {
 
 	return nil
 }
+
+// Report describes rows and partitions rendered into the SQLite CLI import.
+func (w *SQLite3CLIWriter) Report() TargetReport {
+	rep := w.mainCSV.Report()
+	rep.Type = "sqlite_cli"
+
+	return rep
+}
